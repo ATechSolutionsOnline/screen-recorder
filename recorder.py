@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 import time
@@ -206,6 +207,53 @@ except ImportError:
     AUDIO_AVAILABLE = False
 
 
+def _find_loopback_device():
+    """Return device index for system-audio capture (WASAPI loopback or Stereo Mix)."""
+    if not AUDIO_AVAILABLE:
+        return None
+    try:
+        hostapis = sd.query_hostapis()
+        devices  = sd.query_devices()
+        wasapi   = next((i for i, h in enumerate(hostapis)
+                         if 'WASAPI' in h['name']), None)
+        if wasapi is not None:
+            for i, d in enumerate(devices):
+                if (d.get('hostapi') == wasapi
+                        and d.get('max_input_channels', 0) > 0
+                        and 'loopback' in d['name'].lower()):
+                    return i
+        for i, d in enumerate(devices):
+            if d.get('max_input_channels', 0) > 0:
+                n = d['name'].lower()
+                if any(k in n for k in ('stereo mix', 'what u hear', 'wave out mix')):
+                    return i
+    except Exception:
+        pass
+    return None
+
+
+def _open_input(device, sr_pref, channels, blocksize, callback):
+    """Open sd.InputStream with sample-rate fallbacks.  Returns (stream, sr, ch)."""
+    if not AUDIO_AVAILABLE:
+        return None, sr_pref, channels
+    try:
+        info   = sd.query_devices(device) if device is not None \
+                 else sd.query_devices(kind='input')
+        dev_sr = int(info.get('default_samplerate', sr_pref))
+        ch     = min(max(int(info.get('max_input_channels', channels)), 1), channels)
+    except Exception:
+        dev_sr, ch = sr_pref, channels
+    for rate in dict.fromkeys([sr_pref, dev_sr, 48000, 44100]):
+        try:
+            s = sd.InputStream(samplerate=rate, channels=ch, dtype='float32',
+                               device=device, blocksize=blocksize,
+                               callback=callback)
+            return s, rate, ch
+        except Exception:
+            continue
+    return None, sr_pref, channels
+
+
 def _hidden_subprocess():
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -217,13 +265,12 @@ def _hidden_subprocess():
 
 class ScreenRecorder:
     def __init__(self, output_dir, fps=30, region=None,
-                 record_audio=True, audio_device=None,
+                 record_audio=True,
                  show_cursor=True, output_resolution=None):
         self.output_dir        = output_dir
         self.fps               = fps
         self.region            = region
         self.record_audio      = record_audio and AUDIO_AVAILABLE
-        self.audio_device      = audio_device
         self.show_cursor       = show_cursor
         self.output_resolution = output_resolution  # None | (W, H)
 
@@ -363,30 +410,88 @@ class ScreenRecorder:
     # ── Audio loop ────────────────────────────────────────────────────────────
 
     def _audio_loop(self):
-        sr     = self._audio_sample_rate
-        chunks = self._audio_chunks
-        blk    = int(sr * 0.05)
+        SR  = self._audio_sample_rate   # 44100
+        BLK = int(SR * 0.05)
 
-        def callback(indata, frames, t, status):
-            if self._paused or self._mic_muted:
-                chunks.append(np.zeros((frames, indata.shape[1]), dtype="float32"))
+        sys_buf, mic_buf = [], []
+        _sys_sr = [SR]
+        _mic_sr = [SR]
+
+        def _stereo(data):
+            if data.shape[1] == 1:
+                return np.repeat(data, 2, axis=1)
+            return data[:, :2]
+
+        def _sys_cb(indata, frames, t, status):
+            if self._paused:
+                sys_buf.append(np.zeros((frames, 2), 'float32'))
             else:
-                chunks.append(indata.copy())
+                sys_buf.append(_stereo(indata).copy())
+
+        def _mic_cb(indata, frames, t, status):
+            if self._paused or self._mic_muted:
+                mic_buf.append(np.zeros((frames, 2), 'float32'))
+            else:
+                mic_buf.append(_stereo(indata).copy())
+
+        streams = []
+
+        # System audio (WASAPI loopback or Stereo Mix)
+        lb = _find_loopback_device()
+        if lb is not None:
+            s, sr, _ = _open_input(lb, SR, 2, BLK, _sys_cb)
+            if s is not None:
+                _sys_sr[0] = sr
+                streams.append(s)
+
+        # Microphone (default input device)
+        s, sr, _ = _open_input(None, SR, 2, BLK, _mic_cb)
+        if s is not None:
+            _mic_sr[0] = sr
+            streams.append(s)
+
+        if not streams:
+            return
 
         try:
-            with sd.InputStream(samplerate=sr, channels=2, dtype="float32",
-                                 device=self.audio_device, blocksize=blk,
-                                 callback=callback):
+            with contextlib.ExitStack() as stack:
+                for s in streams:
+                    stack.enter_context(s)
                 while self._recording:
                     time.sleep(0.05)
         except Exception:
+            pass
+
+        sys_audio = np.concatenate(sys_buf, axis=0) if sys_buf else None
+        mic_audio = np.concatenate(mic_buf, axis=0) if mic_buf else None
+
+        if sys_audio is None and mic_audio is None:
             return
 
-        if not chunks:
-            return
-        audio     = np.concatenate(chunks, axis=0)
-        audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-        wavfile.write(self._temp_audio, sr, audio_i16)
+        # Resample mic to match system audio rate if they differ
+        if sys_audio is not None and mic_audio is not None \
+                and _sys_sr[0] != _mic_sr[0]:
+            try:
+                from scipy.signal import resample as _rs
+                n = int(len(mic_audio) * _sys_sr[0] / _mic_sr[0])
+                mic_audio = _rs(mic_audio, n).astype('float32')
+            except Exception:
+                mic_audio = None
+
+        if sys_audio is not None and mic_audio is not None:
+            n = max(len(sys_audio), len(mic_audio))
+            def _pad(a):
+                diff = n - len(a)
+                return np.vstack([a, np.zeros((diff, 2), 'float32')]) if diff > 0 else a
+            mixed    = np.clip(_pad(sys_audio) + _pad(mic_audio), -1.0, 1.0)
+            final_sr = _sys_sr[0]
+        elif sys_audio is not None:
+            mixed, final_sr = sys_audio, _sys_sr[0]
+        else:
+            mixed, final_sr = mic_audio, _mic_sr[0]
+
+        audio_i16 = (mixed * 32767).astype(np.int16)
+        wavfile.write(self._temp_audio, final_sr, audio_i16)
 
     # ── Finalize ──────────────────────────────────────────────────────────────
 
@@ -405,18 +510,13 @@ class ScreenRecorder:
             self._cleanup(self._temp_video, self._temp_audio)
             return self._output_path
 
+        # FFmpeg unavailable or failed — single video-only file, no stray audio
+        self._cleanup(self._temp_audio)
         avi = self._output_path.replace(".mp4", ".avi")
         try:
             os.rename(self._temp_video, avi)
         except OSError:
             avi = self._temp_video
-
-        if has_audio and os.path.exists(self._temp_audio):
-            wav = self._output_path.replace(".mp4", ".wav")
-            try:
-                os.rename(self._temp_audio, wav)
-            except OSError:
-                pass
         return avi
 
     def _ffmpeg_merge(self) -> bool:

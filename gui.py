@@ -61,35 +61,16 @@ class _Pill(tk.Label):
         )
 
 
-# ── Audio devices ─────────────────────────────────────────────────────────────
-
-def _query_audio_devices():
-    if not AUDIO_AVAILABLE:
-        return [("Default (System)", None)]
-    try:
-        import sounddevice as sd
-        stereo, others = [], []
-        for i, d in enumerate(sd.query_devices()):
-            if d["max_input_channels"] > 0:
-                n = d["name"][:46]
-                (stereo if "stereo mix" in n.lower() else others).append((n, i))
-        devs = stereo + others
-    except Exception:
-        devs = []
-    return devs or [("Default (System)", None)]
-
-
 # ── Application ───────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self._cfg           = config.load()
-        self._recorder      = None
-        self._region        = None
-        self._audio_devices = _query_audio_devices()
-        self._rec_blink_on  = False
+        self._cfg          = config.load()
+        self._recorder     = None
+        self._region       = None
+        self._rec_blink_on = False
 
         self._setup_window()
         self._build_ui()
@@ -270,20 +251,15 @@ class App(tk.Tk):
         aud_top = tk.Frame(aud, bg=C["card"])
         aud_top.pack(fill=tk.X)
 
-        dev_labels = [d[0] for d in self._audio_devices]
-        self._audio_dev_var = tk.StringVar(value=dev_labels[0])
-        combo_state = "readonly" if AUDIO_AVAILABLE else tk.DISABLED
-
-        self._audio_combo = ttk.Combobox(
-            aud_top, textvariable=self._audio_dev_var,
-            values=dev_labels, width=30, state=combo_state)
-        self._audio_combo.pack(side=tk.LEFT, ipady=3, fill=tk.X, expand=True)
-
         self._audio_enable_var = tk.BooleanVar(
             value=self._cfg.get("record_audio", True) and AUDIO_AVAILABLE)
-        tk.Label(aud_top, text=" Audio",
+
+        tk.Label(aud_top, text="System Audio + Mic",
+                 font=("Segoe UI", 9), fg=C["text"],
+                 bg=C["card"]).pack(side=tk.LEFT)
+        tk.Label(aud_top, text="  Audio",
                  font=("Segoe UI", 9), fg=C["dim"],
-                 bg=C["card"]).pack(side=tk.LEFT, padx=(8, 3))
+                 bg=C["card"]).pack(side=tk.LEFT, padx=(12, 3))
         _Pill(aud_top, self._audio_enable_var).pack(side=tk.LEFT)
 
         if not AUDIO_AVAILABLE:
@@ -425,13 +401,6 @@ class App(tk.Tk):
 
     # ── Recording control ─────────────────────────────────────────────────────
 
-    def _selected_audio_device(self):
-        label = self._audio_dev_var.get()
-        for name, idx in self._audio_devices:
-            if name == label:
-                return idx
-        return None
-
     def _start(self):
         if self._recorder and self._recorder.recording:
             return
@@ -468,7 +437,6 @@ class App(tk.Tk):
             fps               = int(self._fps_var.get()),
             region            = region,
             record_audio      = self._audio_enable_var.get(),
-            audio_device      = self._selected_audio_device(),
             show_cursor       = self._cursor_var.get(),
             output_resolution = output_res,
         )
