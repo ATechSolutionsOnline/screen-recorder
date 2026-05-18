@@ -1,0 +1,46 @@
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+_build_tmp/
+build/
+*.spec
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── App config (user-specific, generated at runtime) ─────────────────────────
+config.json
+
+# ── Generated icon (recreated at build time) ──────────────────────────────────
+icon.ico
+
+# ── Temp recording files ───────────────────────────────────────────────────────
+*.avi
+*.wav
+rec_*
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Skills / tooling lock files ───────────────────────────────────────────────
+skills-lock.json
+.agents/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+*_merge_error.txt
