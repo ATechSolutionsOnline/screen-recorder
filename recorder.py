@@ -263,24 +263,44 @@ def _find_loopback_device():
 
 
 def _open_input(device, sr_pref, channels, blocksize, callback):
-    """Open sd.InputStream with sample-rate fallbacks.  Returns (stream, sr, ch)."""
+    """Open sd.InputStream with sample-rate fallbacks.  Returns (stream, sr, ch).
+
+    When device=None, tries PortAudio default first, then falls back to the
+    first enumerable input device — fixes 'Error querying device -1' on
+    systems where PortAudio has no configured default input.
+    """
     if not AUDIO_AVAILABLE:
         return None, sr_pref, channels
-    try:
-        info   = sd.query_devices(device) if device is not None \
-                 else sd.query_devices(kind='input')
-        dev_sr = int(info.get('default_samplerate', sr_pref))
-        ch     = min(max(int(info.get('max_input_channels', channels)), 1), channels)
-    except Exception:
-        dev_sr, ch = sr_pref, channels
-    for rate in dict.fromkeys([sr_pref, dev_sr, 48000, 44100]):
+
+    # Build list of device indices to attempt
+    candidates: list[int | None] = [device]
+    if device is None:
         try:
-            s = sd.InputStream(samplerate=rate, channels=ch, dtype='float32',
-                               device=device, blocksize=blocksize,
-                               callback=callback)
-            return s, rate, ch
+            for i, d in enumerate(sd.query_devices()):
+                if d.get('max_input_channels', 0) > 0:
+                    candidates.append(i)   # first real input device as fallback
+                    break
         except Exception:
-            continue
+            pass
+
+    for dev in candidates:
+        try:
+            info   = sd.query_devices(dev) if dev is not None \
+                     else sd.query_devices(kind='input')
+            dev_sr = int(info.get('default_samplerate', sr_pref))
+            ch     = min(max(int(info.get('max_input_channels', channels)), 1), channels)
+        except Exception:
+            dev_sr, ch = sr_pref, channels
+
+        for rate in dict.fromkeys([sr_pref, dev_sr, 48000, 44100]):
+            try:
+                s = sd.InputStream(samplerate=rate, channels=ch, dtype='float32',
+                                   device=dev, blocksize=blocksize,
+                                   callback=callback)
+                return s, rate, ch
+            except Exception:
+                continue
+
     return None, sr_pref, channels
 
 
