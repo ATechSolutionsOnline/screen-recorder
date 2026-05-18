@@ -434,33 +434,46 @@ class ScreenRecorder:
             else:
                 mic_buf.append(_stereo(indata).copy())
 
-        streams = []
+        active = []
 
-        # System audio (WASAPI loopback or Stereo Mix)
+        # ── System audio (WASAPI loopback / Stereo Mix) ──────────────────────
+        # Started independently — failure here must NOT affect the mic stream.
         lb = _find_loopback_device()
         if lb is not None:
             s, sr, _ = _open_input(lb, SR, 2, BLK, _sys_cb)
             if s is not None:
-                _sys_sr[0] = sr
-                streams.append(s)
+                try:
+                    s.start()
+                    _sys_sr[0] = sr
+                    active.append(s)
+                except Exception:
+                    try: s.close()
+                    except Exception: pass
 
-        # Microphone (default input device)
+        # ── Microphone (default input) ────────────────────────────────────────
+        # Always attempted regardless of loopback result.
         s, sr, _ = _open_input(None, SR, 2, BLK, _mic_cb)
         if s is not None:
-            _mic_sr[0] = sr
-            streams.append(s)
+            try:
+                s.start()
+                _mic_sr[0] = sr
+                active.append(s)
+            except Exception:
+                try: s.close()
+                except Exception: pass
 
-        if not streams:
+        if not active:
             return
 
         try:
-            with contextlib.ExitStack() as stack:
-                for s in streams:
-                    stack.enter_context(s)
-                while self._recording:
-                    time.sleep(0.05)
-        except Exception:
-            pass
+            while self._recording:
+                time.sleep(0.05)
+        finally:
+            for s in active:
+                try: s.stop()
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
 
         sys_audio = np.concatenate(sys_buf, axis=0) if sys_buf else None
         mic_audio = np.concatenate(mic_buf, axis=0) if mic_buf else None
@@ -468,7 +481,7 @@ class ScreenRecorder:
         if sys_audio is None and mic_audio is None:
             return
 
-        # Resample mic to match system audio rate if they differ
+        # Resample mic to match system-audio rate if they differ
         if sys_audio is not None and mic_audio is not None \
                 and _sys_sr[0] != _mic_sr[0]:
             try:
