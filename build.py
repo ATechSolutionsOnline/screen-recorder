@@ -91,15 +91,22 @@ def build_exe(ffmpeg_path: Path, icon_path: Path) -> Path:
 
     spec = textwrap.dedent(f"""\
         # -*- mode: python ; coding: utf-8 -*-
+        from PyInstaller.utils.hooks import collect_all, collect_data_files
+
+        # sounddevice + _sounddevice_data (PortAudio DLLs)
+        # collect_all ensures libportaudio64bit.dll is bundled on every machine
+        _sd_d,  _sd_b,  _sd_h  = collect_all('sounddevice')
+        _sdd_d, _sdd_b, _sdd_h = collect_all('_sounddevice_data')
+
         a = Analysis(
             [r'{BASE / "main.py"}'],
             pathex=[r'{BASE}'],
             binaries=[
                 (r'{ffmpeg_path}', '.'),
-            ],
+            ] + _sd_b + _sdd_b,
             datas=[
                 (r'{icon_path}', '.'),
-            ],
+            ] + _sd_d + _sdd_d,
             hiddenimports=[
                 'mss', 'mss.windows',
                 'cv2',
@@ -109,9 +116,10 @@ def build_exe(ffmpeg_path: Path, icon_path: Path) -> Path:
                 'scipy._lib', 'scipy._lib.messagestream',
                 'PIL', 'PIL.Image', 'PIL.ImageDraw',
                 'cffi', '_cffi_backend',
+                'winreg',
                 'config', 'recorder', 'gui',
                 'region_selector', 'create_icon',
-            ],
+            ] + _sd_h + _sdd_h,
             hookspath=[],
             runtime_hooks=[],
             excludes=[

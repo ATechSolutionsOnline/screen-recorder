@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import config
-from recorder import ScreenRecorder, AUDIO_AVAILABLE
+from recorder import ScreenRecorder, AUDIO_AVAILABLE, AUDIO_LOAD_ERROR
 from region_selector import RegionSelector
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -263,7 +263,8 @@ class App(tk.Tk):
         _Pill(aud_top, self._audio_enable_var).pack(side=tk.LEFT)
 
         if not AUDIO_AVAILABLE:
-            tk.Label(aud, text="⚠  sounddevice not installed",
+            err_short = (AUDIO_LOAD_ERROR or "sounddevice not installed")[:72]
+            tk.Label(aud, text=f"⚠  {err_short}",
                      font=("Segoe UI", 8),
                      fg=C["orange"], bg=C["card"]).pack(anchor=tk.W, pady=(3, 0))
 
@@ -477,10 +478,12 @@ class App(tk.Tk):
         self._pause_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.DISABLED)
         self._mic_btn.config(state=tk.DISABLED)
-        threading.Thread(
-            target=lambda: self.after(0, lambda: self._on_saved(self._recorder.stop())),
-            daemon=True,
-        ).start()
+        rec = self._recorder   # capture ref before thread
+        def _do_stop():
+            path = rec.stop()
+            warn = rec._audio_warn
+            self.after(0, lambda: self._on_saved(path, warn))
+        threading.Thread(target=_do_stop, daemon=True).start()
 
     def _toggle_mic(self):
         if not self._recorder:
@@ -493,7 +496,7 @@ class App(tk.Tk):
             "Mic muted" if muted
             else ("Paused" if self._recorder.paused else "Recording…"))
 
-    def _on_saved(self, path):
+    def _on_saved(self, path, audio_warn=None):
         self._recorder = None
         self._start_btn.config(state=tk.NORMAL)
         self._pause_btn.config(state=tk.DISABLED, text="⏸  Pause", fg=C["text"])
@@ -506,12 +509,16 @@ class App(tk.Tk):
             mb = os.path.getsize(path) / 1e6
             self._status_var.set(
                 f"Saved  ·  {os.path.basename(path)}  ({mb:.1f} MB)")
+            if audio_warn:
+                messagebox.showwarning("Audio Notice", audio_warn)
             if messagebox.askyesno("Recording Saved",
                                    f"File saved:\n{path}\n"
                                    f"Size: {mb:.1f} MB\n\nOpen folder?"):
                 os.startfile(os.path.dirname(path))
         else:
             self._status_var.set("Save failed — check output folder")
+            if audio_warn:
+                messagebox.showwarning("Audio Notice", audio_warn)
             messagebox.showerror("Save Error", "Could not save the recording.")
 
     # ── Timer / REC blink ─────────────────────────────────────────────────────

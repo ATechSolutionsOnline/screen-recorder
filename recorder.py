@@ -202,9 +202,39 @@ def _draw_cursor(frame: np.ndarray, sx: int, sy: int,
 try:
     import sounddevice as sd
     import scipy.io.wavfile as wavfile
+    sd.query_devices()          # triggers PortAudio DLL load — catches missing DLL early
     AUDIO_AVAILABLE = True
-except ImportError:
+    AUDIO_LOAD_ERROR: str | None = None
+except Exception as _audio_ex:
     AUDIO_AVAILABLE = False
+    AUDIO_LOAD_ERROR: str | None = str(_audio_ex)
+
+
+def _mic_permission_ok() -> bool:
+    """Return False when Windows Mic Privacy is set to Deny."""
+    try:
+        import winreg
+        _REG = (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                r"\CapabilityAccessManager\ConsentStore\microphone")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG) as k:
+            val, _ = winreg.QueryValueEx(k, "Value")
+        return str(val).lower() != "deny"
+    except Exception:
+        return True     # registry unreadable → assume allowed
+
+
+def _resample_np(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Linear resampling via numpy — no scipy native DLLs required."""
+    if orig_sr == target_sr or len(audio) == 0:
+        return audio
+    n_orig   = len(audio)
+    n_target = max(1, int(n_orig * target_sr / orig_sr))
+    x_src    = np.arange(n_orig, dtype=np.float64)
+    x_dst    = np.linspace(0, n_orig - 1, n_target)
+    out      = np.empty((n_target, audio.shape[1]), dtype=np.float32)
+    for ch in range(audio.shape[1]):
+        out[:, ch] = np.interp(x_dst, x_src, audio[:, ch].astype(np.float64))
+    return out
 
 
 def _find_loopback_device():
@@ -277,6 +307,7 @@ class ScreenRecorder:
         self._recording  = False
         self._paused     = False
         self._mic_muted  = False
+        self._audio_warn: str | None = None   # set when audio has a recoverable issue
 
         self._video_thread = None
         self._audio_thread = None
@@ -451,16 +482,29 @@ class ScreenRecorder:
                     except Exception: pass
 
         # ── Microphone (default input) ────────────────────────────────────────
-        # Always attempted regardless of loopback result.
-        s, sr, _ = _open_input(None, SR, 2, BLK, _mic_cb)
-        if s is not None:
-            try:
-                s.start()
-                _mic_sr[0] = sr
-                active.append(s)
-            except Exception:
-                try: s.close()
-                except Exception: pass
+        # Check Windows Privacy before attempting to open the mic.
+        if not _mic_permission_ok():
+            self._audio_warn = (
+                "Microphone access is blocked by Windows Privacy settings.\n\n"
+                "To fix:\n"
+                "  Settings → Privacy & Security → Microphone\n"
+                "  Turn ON  'Let desktop apps access your microphone'"
+            )
+        else:
+            s, sr, _ = _open_input(None, SR, 2, BLK, _mic_cb)
+            if s is not None:
+                try:
+                    s.start()
+                    _mic_sr[0] = sr
+                    active.append(s)
+                except Exception as e:
+                    self._audio_warn = f"Microphone could not be opened: {e}"
+                    try: s.close()
+                    except Exception: pass
+            else:
+                self._audio_warn = (
+                    "No microphone found. Connect a mic or check audio drivers."
+                )
 
         if not active:
             return
@@ -481,13 +525,11 @@ class ScreenRecorder:
         if sys_audio is None and mic_audio is None:
             return
 
-        # Resample mic to match system-audio rate if they differ
+        # Resample mic to match system-audio rate if they differ (pure numpy)
         if sys_audio is not None and mic_audio is not None \
                 and _sys_sr[0] != _mic_sr[0]:
             try:
-                from scipy.signal import resample as _rs
-                n = int(len(mic_audio) * _sys_sr[0] / _mic_sr[0])
-                mic_audio = _rs(mic_audio, n).astype('float32')
+                mic_audio = _resample_np(mic_audio, _mic_sr[0], _sys_sr[0])
             except Exception:
                 mic_audio = None
 
