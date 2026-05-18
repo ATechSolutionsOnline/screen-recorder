@@ -46,7 +46,7 @@ Run the installer and launch **Screen Recorder** from the desktop or Start menu.
 ### Quick start
 
 ```bat
-git clone https://github.com/YOUR_USERNAME/screen-recorder.git
+git clone https://github.com/ATechSolutionsOnline/screen-recorder.git
 cd screen-recorder
 install.bat        # installs Python dependencies
 python main.py     # run without building
