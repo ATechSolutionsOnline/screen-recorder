@@ -1,5 +1,6 @@
 import contextlib
 import os
+import re as _re
 import sys
 import time
 import ctypes
@@ -209,6 +210,23 @@ except Exception as _audio_ex:
     AUDIO_AVAILABLE = False
     AUDIO_LOAD_ERROR: str | None = str(_audio_ex)
 
+# Check FFmpeg availability at import time for GUI use
+def _check_ffmpeg() -> bool:
+    import shutil
+    if getattr(sys, "frozen", False):
+        # PyInstaller 6+ stores bundled files in sys._MEIPASS (the _internal/ folder).
+        # sys.executable is the .exe itself; its directory does NOT contain bundled files.
+        for base in [
+            getattr(sys, '_MEIPASS', None),
+            os.path.dirname(sys.executable),
+            os.path.join(os.path.dirname(sys.executable), '_internal'),
+        ]:
+            if base and os.path.exists(os.path.join(base, 'ffmpeg.exe')):
+                return True
+    return bool(shutil.which("ffmpeg"))
+
+FFMPEG_AVAILABLE: bool = _check_ffmpeg()
+
 
 def _mic_permission_ok() -> bool:
     """Return False when Windows Mic Privacy is set to Deny."""
@@ -278,8 +296,7 @@ def _open_input(device, sr_pref, channels, blocksize, callback):
         try:
             for i, d in enumerate(sd.query_devices()):
                 if d.get('max_input_channels', 0) > 0:
-                    candidates.append(i)   # first real input device as fallback
-                    break
+                    candidates.append(i)   # try every real input device as fallback
         except Exception:
             pass
 
@@ -311,6 +328,48 @@ def _hidden_subprocess():
     return si
 
 
+def _enum_dshow_audio(ffmpeg_path: str) -> list[str]:
+    """Return DirectShow audio input device names via FFmpeg enumeration."""
+    try:
+        r = subprocess.run(
+            [ffmpeg_path, '-f', 'dshow', '-list_devices', 'true', '-i', 'dummy'],
+            capture_output=True, timeout=10,
+            startupinfo=_hidden_subprocess()
+        )
+        text  = (r.stdout + r.stderr).decode('utf-8', errors='replace')
+        names: list[str] = []
+        in_audio = False
+        for line in text.splitlines():
+            if 'DirectShow audio devices' in line:
+                in_audio = True
+                continue
+            if in_audio:
+                if '@device' in line:
+                    continue
+                m = _re.search(r'"([^"]+)"', line)
+                if m:
+                    names.append(m.group(1))
+        return names
+    except Exception:
+        return []
+
+
+def _try_start(cmd: list, si, wait: float = 1.0):
+    """Start a subprocess; return it if still alive after `wait` seconds, else None."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             startupinfo=si)
+        time.sleep(wait)
+        if p.poll() is None:
+            return p
+        try: p.terminate()
+        except Exception: pass
+    except Exception:
+        pass
+    return None
+
+
 # ── Recorder ─────────────────────────────────────────────────────────────────
 
 class ScreenRecorder:
@@ -320,7 +379,7 @@ class ScreenRecorder:
         self.output_dir        = output_dir
         self.fps               = fps
         self.region            = region
-        self.record_audio      = record_audio and AUDIO_AVAILABLE
+        self.record_audio      = record_audio and (AUDIO_AVAILABLE or FFMPEG_AVAILABLE)
         self.show_cursor       = show_cursor
         self.output_resolution = output_resolution  # None | (W, H)
 
@@ -461,6 +520,190 @@ class ScreenRecorder:
     # ── Audio loop ────────────────────────────────────────────────────────────
 
     def _audio_loop(self):
+        ffmpeg = self._find_ffmpeg()
+        if ffmpeg:
+            try:
+                if self._audio_loop_ffmpeg(ffmpeg):
+                    return
+            except Exception:
+                pass
+        if AUDIO_AVAILABLE:
+            self._audio_loop_sounddevice()
+
+    def _audio_loop_ffmpeg(self, ffmpeg_path: str) -> bool:
+        """Capture audio via FFmpeg — no PortAudio dependency.
+
+        Strategy:
+          System audio  → WASAPI loopback  (primary)
+                        → dshow Stereo Mix (fallback)
+          Microphone    → dshow named device (primary, most compatible)
+                        → WASAPI default input (fallback)
+          Format        → capture in device-native format; resample to
+                          44100 Hz stereo during mix (maximum compatibility)
+        """
+        ts_base  = os.path.splitext(self._temp_audio)[0]
+        sys_wav  = ts_base + '_sys.wav'
+        mic_wav  = ts_base + '_mic.wav'
+        si       = _hidden_subprocess()
+        sys_proc = mic_proc = None
+
+        # Enumerate DirectShow audio devices once (used for sys fallback + mic)
+        dshow_devs  = _enum_dshow_audio(ffmpeg_path)
+        _lb_kw      = ('stereo mix', 'what u hear', 'wave out mix', 'loopback')
+
+        # ── System audio ─────────────────────────────────────────────────────
+        # 1st try: WASAPI loopback — captures whatever the speakers are playing
+        sys_proc = _try_start(
+            [ffmpeg_path, '-y', '-f', 'wasapi', '-loopback',
+             '-rtbufsize', '100M', '-i', 'default', sys_wav],
+            si, wait=1.2)
+
+        # 2nd try: dshow Stereo Mix / What-U-Hear
+        if sys_proc is None:
+            for dev in dshow_devs:
+                if any(k in dev.lower() for k in _lb_kw):
+                    sys_proc = _try_start(
+                        [ffmpeg_path, '-y', '-f', 'dshow',
+                         '-rtbufsize', '100M', '-i', f'audio={dev}', sys_wav],
+                        si, wait=1.2)
+                    if sys_proc:
+                        break
+
+        # ── Microphone ───────────────────────────────────────────────────────
+        if not _mic_permission_ok():
+            self._audio_warn = (
+                "Microphone access is blocked by Windows Privacy settings.\n\n"
+                "Fix: Settings → Privacy & Security → Microphone\n"
+                "     Turn ON  'Let desktop apps access your microphone'"
+            )
+        else:
+            # Pick first non-loopback dshow device as the mic
+            mic_name = next(
+                (d for d in dshow_devs
+                 if not any(k in d.lower() for k in _lb_kw)),
+                None
+            )
+
+            # 1st try: dshow explicit device name
+            if mic_name:
+                mic_proc = _try_start(
+                    [ffmpeg_path, '-y', '-f', 'dshow',
+                     '-rtbufsize', '100M', '-i', f'audio={mic_name}', mic_wav],
+                    si, wait=1.2)
+
+            # 2nd try: WASAPI default input
+            if mic_proc is None:
+                mic_proc = _try_start(
+                    [ffmpeg_path, '-y', '-f', 'wasapi',
+                     '-rtbufsize', '100M', '-i', 'default', mic_wav],
+                    si, wait=1.2)
+
+            if mic_proc is None and sys_proc is not None:
+                pass   # system audio only — that's fine
+            elif mic_proc is None and sys_proc is None:
+                pass   # no audio at all — checked below
+
+        if sys_proc is None and mic_proc is None:
+            return False
+
+        # ── Track silence intervals ───────────────────────────────────────────
+        rec_t0      = time.perf_counter()
+        pause_start = mute_start = None
+        pause_ivs:  list[tuple[float,float]] = []
+        mute_ivs:   list[tuple[float,float]] = []
+
+        while self._recording:
+            now = time.perf_counter() - rec_t0
+            if self._paused and pause_start is None:
+                pause_start = now
+            elif not self._paused and pause_start is not None:
+                pause_ivs.append((pause_start, now))
+                pause_start = None
+            if not self._paused:
+                if self._mic_muted and mute_start is None:
+                    mute_start = now
+                elif not self._mic_muted and mute_start is not None:
+                    mute_ivs.append((mute_start, now))
+                    mute_start = None
+            time.sleep(0.05)
+
+        now = time.perf_counter() - rec_t0
+        if pause_start is not None:
+            pause_ivs.append((pause_start, now))
+        if mute_start is not None:
+            mute_ivs.append((mute_start, now))
+
+        # ── Stop FFmpeg processes ─────────────────────────────────────────────
+        for proc in [sys_proc, mic_proc]:
+            if proc:
+                try:
+                    proc.stdin.write(b'q')
+                    proc.stdin.flush()
+                    proc.wait(timeout=12)
+                except Exception:
+                    try: proc.terminate()
+                    except Exception: pass
+
+        got_sys = (sys_proc is not None
+                   and os.path.exists(sys_wav)
+                   and os.path.getsize(sys_wav) > 44)
+        got_mic = (mic_proc is not None
+                   and os.path.exists(mic_wav)
+                   and os.path.getsize(mic_wav) > 44)
+
+        if not got_sys and not got_mic:
+            return False
+
+        # ── Mix and convert to standard WAV ──────────────────────────────────
+        def _vol_filter(ivs):
+            if not ivs:
+                return None
+            parts = '+'.join(f'between(t,{s:.3f},{e:.3f})' for s, e in ivs)
+            return f"volume=0:enable='{parts}'"
+
+        sys_filt = _vol_filter(pause_ivs)
+        mic_filt = _vol_filter(pause_ivs + mute_ivs)
+
+        mix_cmd = [ffmpeg_path, '-y']
+        if got_sys and got_mic:
+            mix_cmd += ['-i', sys_wav, '-i', mic_wav]
+            fgraph      = []
+            s_lbl, m_lbl = '[0:a]', '[1:a]'
+            if sys_filt:
+                fgraph.append(f'[0:a]{sys_filt}[sf]');  s_lbl = '[sf]'
+            if mic_filt:
+                fgraph.append(f'[1:a]{mic_filt}[mf]');  m_lbl = '[mf]'
+            fgraph.append(f'{s_lbl}{m_lbl}amix=inputs=2:normalize=0[out]')
+            mix_cmd += ['-filter_complex', ';'.join(fgraph), '-map', '[out]']
+        elif got_sys:
+            mix_cmd += ['-i', sys_wav]
+            if sys_filt:
+                mix_cmd += ['-af', sys_filt]
+        else:
+            mix_cmd += ['-i', mic_wav]
+            if mic_filt:
+                mix_cmd += ['-af', mic_filt]
+
+        # Always output 44100 Hz stereo WAV (handles any native device format)
+        mix_cmd += ['-ar', '44100', '-ac', '2', self._temp_audio]
+
+        try:
+            r  = subprocess.run(mix_cmd, capture_output=True,
+                                timeout=120, startupinfo=si)
+            ok = (r.returncode == 0
+                  and os.path.exists(self._temp_audio)
+                  and os.path.getsize(self._temp_audio) > 44)
+        except Exception:
+            ok = False
+
+        for p in [sys_wav, mic_wav]:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
+
+        return ok
+
+    def _audio_loop_sounddevice(self):
         SR  = self._audio_sample_rate   # 44100
         BLK = int(SR * 0.05)
 
@@ -632,9 +875,17 @@ class ScreenRecorder:
     def _find_ffmpeg() -> str | None:
         import shutil
         if getattr(sys, "frozen", False):
-            bundled = os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe")
-            if os.path.exists(bundled):
-                return bundled
+            # PyInstaller 6+ stores bundled files in sys._MEIPASS (_internal/).
+            # Check all plausible locations in priority order.
+            for base in [
+                getattr(sys, '_MEIPASS', None),
+                os.path.dirname(sys.executable),
+                os.path.join(os.path.dirname(sys.executable), '_internal'),
+            ]:
+                if base:
+                    p = os.path.join(base, 'ffmpeg.exe')
+                    if os.path.exists(p):
+                        return p
         found = shutil.which("ffmpeg")
         if found:
             return found

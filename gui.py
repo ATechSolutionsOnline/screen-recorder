@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import config
-from recorder import ScreenRecorder, AUDIO_AVAILABLE, AUDIO_LOAD_ERROR
+from recorder import ScreenRecorder, AUDIO_AVAILABLE, AUDIO_LOAD_ERROR, FFMPEG_AVAILABLE
 from region_selector import RegionSelector
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -252,7 +252,7 @@ class App(tk.Tk):
         aud_top.pack(fill=tk.X)
 
         self._audio_enable_var = tk.BooleanVar(
-            value=self._cfg.get("record_audio", True) and AUDIO_AVAILABLE)
+            value=self._cfg.get("record_audio", True) and (AUDIO_AVAILABLE or FFMPEG_AVAILABLE))
 
         tk.Label(aud_top, text="System Audio + Mic",
                  font=("Segoe UI", 9), fg=C["text"],
@@ -262,7 +262,7 @@ class App(tk.Tk):
                  bg=C["card"]).pack(side=tk.LEFT, padx=(12, 3))
         _Pill(aud_top, self._audio_enable_var).pack(side=tk.LEFT)
 
-        if not AUDIO_AVAILABLE:
+        if not AUDIO_AVAILABLE and not FFMPEG_AVAILABLE:
             err_short = (AUDIO_LOAD_ERROR or "sounddevice not installed")[:72]
             tk.Label(aud, text=f"⚠  {err_short}",
                      font=("Segoe UI", 8),
@@ -445,7 +445,7 @@ class App(tk.Tk):
 
         self._pause_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.NORMAL)
-        if self._audio_enable_var.get() and AUDIO_AVAILABLE:
+        if self._audio_enable_var.get() and (AUDIO_AVAILABLE or FFMPEG_AVAILABLE):
             self._mic_btn.config(state=tk.NORMAL, fg=C["blue"])
 
         if self._hide_var.get():
